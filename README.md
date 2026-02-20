@@ -24,3 +24,6 @@ ACS Income Data for Seattle - https://data-seattlecitygis.opendata.arcgis.com/da
 
 TIGER/Line Shapefile, All Roads, King County - https://catalog.data.gov/dataset/tiger-line-shapefile-2021-county-king-county-wa-all-roads
 
+## Ai disclosure: 
+
+I used AI to debug projection issues with capita income file and combining the file in QGIS, I also needed help with choropleth breaks and binning, rendering and data loading.
