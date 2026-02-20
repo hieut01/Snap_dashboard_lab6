@@ -1,0 +1,488 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SNAP + Income Dashboard</title>
+
+  <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+
+  <style>
+    html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    #app{height:100%;display:flex}
+    #sidebar{width:340px;padding:12px;border-right:1px solid #ddd;box-sizing:border-box;overflow:auto}
+    #map{flex:1}
+    h1{font-size:16px;margin:0 0 8px}
+    .small{font-size:12px;color:#555;line-height:1.35}
+    .kpis{display:grid;gap:8px;margin:10px 0}
+    .kpi{border:1px solid #ddd;border-radius:12px;padding:10px}
+    .kpi .label{font-size:12px;color:#666}
+    .kpi .val{font-size:22px;font-weight:800;margin-top:2px}
+    .btn{width:100%;padding:10px;border-radius:12px;border:1px solid #ddd;background:#f6f6f6;font-weight:700;cursor:pointer}
+    .btn:active{transform:translateY(1px)}
+    .bars{margin-top:10px;display:grid;gap:6px}
+    .barrow{display:grid;grid-template-columns:78px 1fr 44px;gap:8px;align-items:center}
+    .barlabel{font-size:12px;color:#444}
+    .barwrap{height:10px;background:#eee;border-radius:999px;overflow:hidden}
+    .bar{height:100%;background:#333;width:0%}
+    .barval{font-size:12px;color:#444;text-align:right}
+    .note{margin-top:10px;font-size:12px;color:#666;white-space:pre-wrap}
+    .legend{display:grid;gap:6px;margin-top:10px}
+    .legrow{display:flex;gap:8px;align-items:center;font-size:12px;color:#444}
+    .sw{width:12px;height:12px;border-radius:3px;border:1px solid #ccc}
+    .divider{height:1px;background:#eee;margin:10px 0}
+  </style>
+</head>
+
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h1>SNAP Retailers + Income</h1>
+    <div class="small">
+      Choropleth: per-capita income (<b id="fieldName">—</b>)<br/>
+      Points: SNAP retailers filtered to <b>King County, WA</b>
+    </div>
+
+    <div class="kpis">
+      <div class="kpi">
+        <div class="label">SNAP retailers (King County)</div>
+        <div class="val" id="kTotal">—</div>
+      </div>
+      <div class="kpi">
+        <div class="label">SNAP retailers in view</div>
+        <div class="val" id="kView">—</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Avg per-capita income (tracts in view)</div>
+        <div class="val" id="kAvgInc">—</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Retailers per 10k people (in view)</div>
+        <div class="val" id="kRate">—</div>
+      </div>
+    </div>
+
+    <div class="small"><b>Retailers by income level (in view)</b></div>
+    <div class="bars" id="bars"></div>
+
+    <div class="divider"></div>
+
+    <div class="small"><b>Income legend</b></div>
+    <div class="legend" id="legend"></div>
+
+    <div style="margin-top:10px">
+      <button class="btn" id="resetBtn">Reset</button>
+    </div>
+
+    <div class="note" id="status"></div>
+  </div>
+
+  <div id="map"></div>
+</div>
+
+<script>
+  // ======= CONFIG =======
+  mapboxgl.accessToken = "pk.eyJ1IjoiaGlldXRyYW4yIiwiYSI6ImNtaGVkdnNvNTBkNG0ybXExNjFobWFpMm8ifQ.csZ4K-7ctmQ5pw29u2U5Pw";
+
+  const INCOME_PATH = "assets/capita_income.geojson";
+  const SNAP_PATH   = "assets/snap_retailer.geojson";
+
+  const START = { center: [-122.3321, 47.6062], zoom: 10.8 };
+
+  const SRC_INCOME = "income";
+  const SRC_SNAP   = "snap";
+  const LYR_INCOME = "income-fill";
+  const LYR_INCOME_OUTLINE = "income-outline";
+  const LYR_SNAP   = "snap-pts";
+
+  // low -> high
+  const COLORS = ["#2b1d3f","#3b2a68","#4a3f8f","#3f6fb3","#37a1c8"];
+
+  // ======= UI =======
+  const kTotal = document.getElementById("kTotal");
+  const kView  = document.getElementById("kView");
+  const kAvgInc = document.getElementById("kAvgInc");
+  const kRate = document.getElementById("kRate");
+  const barsEl = document.getElementById("bars");
+  const legendEl = document.getElementById("legend");
+  const statusEl = document.getElementById("status");
+  const fieldNameEl = document.getElementById("fieldName");
+
+  // ======= STATE =======
+  let incomeFC = null;
+  let snapKingFC = null;
+
+  let INCOME_FIELD = null;      // normalized field name: "per_capita_income"
+  let breaks = null;            // [b1,b2,b3,b4]
+  let incomeHasGeom = false;
+
+  // ======= MAP =======
+  const map = new mapboxgl.Map({
+    container: "map",
+    style: "mapbox://styles/mapbox/light-v11",
+    center: START.center,
+    zoom: START.zoom
+  });
+  map.addControl(new mapboxgl.NavigationControl(), "top-right");
+
+  document.getElementById("resetBtn").onclick = () => map.flyTo({ ...START, essential:true });
+
+  map.on("load", async () => {
+    try {
+      const [income, snap] = await Promise.all([fetchJSON(INCOME_PATH), fetchJSON(SNAP_PATH)]);
+      incomeFC = income;
+      snapKingFC = filterSnapKingCountyWA(snap);
+
+      kTotal.textContent = fmtInt(snapKingFC.features.length);
+
+      incomeHasGeom = (incomeFC.features || []).some(f => f.geometry && f.geometry.type);
+      if (!incomeHasGeom) {
+        statusEl.textContent = "Income GeoJSON has geometry:null → choropleth won’t draw. Re-export income polygons with geometry.";
+      }
+
+      // --- Add SNAP points (always) ---
+      map.addSource(SRC_SNAP, { type:"geojson", data: snapKingFC });
+      map.addLayer({
+        id: LYR_SNAP,
+        type: "circle",
+        source: SRC_SNAP,
+        paint: {
+          "circle-color": "#ffb703",
+          "circle-stroke-color": "#000",
+          "circle-stroke-width": 0.7,
+          "circle-radius": ["interpolate",["linear"],["zoom"], 9,3, 12,5, 14,7],
+          "circle-opacity": 0.9
+        }
+      });
+
+      // --- Add income choropleth (only if geometry exists) ---
+      if (incomeHasGeom) {
+        // Normalize properties so we can use simple keys everywhere
+        normalizeIncomeProps(incomeFC);
+
+        INCOME_FIELD = "per_capita_income";
+        fieldNameEl.textContent = INCOME_FIELD;
+
+        breaks = quintileBreaks(incomeFC, INCOME_FIELD);
+        renderLegend(breaks);
+
+        map.addSource(SRC_INCOME, { type:"geojson", data: incomeFC });
+
+        const expr = ["step", ["to-number", ["get", INCOME_FIELD]],
+          COLORS[0],
+          breaks[0], COLORS[1],
+          breaks[1], COLORS[2],
+          breaks[2], COLORS[3],
+          breaks[3], COLORS[4]
+        ];
+
+        // Put choropleth under the points
+        map.addLayer({
+          id: LYR_INCOME,
+          type: "fill",
+          source: SRC_INCOME,
+          paint: { "fill-color": expr, "fill-opacity": 0.65 }
+        }, LYR_SNAP);
+
+        map.addLayer({
+          id: LYR_INCOME_OUTLINE,
+          type: "line",
+          source: SRC_INCOME,
+          paint: { "line-color": "#000", "line-width": 0.5, "line-opacity": 0.25 }
+        }, LYR_SNAP);
+
+        // Tract popup
+        map.on("click", LYR_INCOME, (e) => {
+          const p = e.features[0].properties || {};
+          const inc = num(p[INCOME_FIELD]);
+          const pop = num(p.population);
+
+          const html = `
+            <div style="font-size:12px;line-height:1.35">
+              <div style="font-weight:800;margin-bottom:4px">${esc(p.NAME || "Census tract")}</div>
+              <div><b>Per-capita income:</b> ${inc != null ? money(inc) : "N/A"}</div>
+              <div><b>Population:</b> ${pop != null ? fmtInt(pop) : "N/A"}</div>
+              <div style="margin-top:4px;color:#555">${esc(p.GEOID20 || "")}</div>
+            </div>`;
+          new mapboxgl.Popup({ offset: 10 }).setLngLat(e.lngLat).setHTML(html).addTo(map);
+        });
+        map.on("mouseenter", LYR_INCOME, () => map.getCanvas().style.cursor = "pointer");
+        map.on("mouseleave", LYR_INCOME, () => map.getCanvas().style.cursor = "");
+      } else {
+        INCOME_FIELD = null;
+        fieldNameEl.textContent = "—";
+        renderLegend(null);
+      }
+
+      // SNAP popup (+ income context if choropleth exists)
+      map.on("click", LYR_SNAP, (e) => {
+        const feat = e.features[0];
+        const p = feat.properties || {};
+        const lngLat = e.lngLat;
+
+        let extra = "";
+        if (incomeHasGeom && map.getLayer(LYR_INCOME)) {
+          const under = getIncomeFeatureAtLngLat(lngLat);
+          if (under) {
+            const ip = under.properties || {};
+            const inc = num(ip.per_capita_income);
+            extra = `
+              <div style="margin-top:6px;padding-top:6px;border-top:1px solid #eee">
+                <div style="font-weight:800;margin-bottom:2px">Tract context</div>
+                <div>${esc(ip.NAME || "Census tract")}</div>
+                <div><b>Per-capita income:</b> ${inc != null ? money(inc) : "N/A"}</div>
+              </div>`;
+          }
+        }
+
+        const html = `
+          <div style="font-size:12px;line-height:1.35">
+            <div style="font-weight:800;margin-bottom:4px">${esc(p.Store_Name || "SNAP Retailer")}</div>
+            <div>${esc(p.Store_Street_Address || "")}</div>
+            <div>${esc([p.City,p.State,p.Zip_Code].filter(Boolean).join(" "))}</div>
+            <div style="margin-top:4px;color:#555">${esc(p.Store_Type || "")}</div>
+            ${extra}
+          </div>`;
+        new mapboxgl.Popup({ offset: 10 }).setLngLat(lngLat).setHTML(html).addTo(map);
+      });
+      map.on("mouseenter", LYR_SNAP, () => map.getCanvas().style.cursor = "pointer");
+      map.on("mouseleave", LYR_SNAP, () => map.getCanvas().style.cursor = "");
+
+      // Initial + idle updates
+      updateSidebar();
+      map.on("idle", debounce(updateSidebar, 200));
+
+      statusEl.textContent = "Loaded. Pan/zoom to refresh counts.";
+
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent =
+        "Error loading files.\n" +
+        "1) Check paths: assets/capita_income.geojson and assets/snap_retailer.geojson\n" +
+        "2) If capita_income.geojson contains pasted HTML (<!doctype html>...), re-export it.\n" +
+        "3) Open DevTools Console for details.";
+    }
+  });
+
+  // ======= SIDEBAR UPDATES =======
+  function updateSidebar(){
+    // SNAP in view (deduped)
+    const snapInView = getSnapFeaturesInViewDeduped();
+    const inViewN = snapInView.length;
+    kView.textContent = fmtInt(inViewN);
+
+    // Income polygons in view
+    let avgInc = null;
+    let popSum = null;
+
+    if (incomeHasGeom && map.getLayer(LYR_INCOME)) {
+      const polys = map.queryRenderedFeatures({ layers:[LYR_INCOME] }) || [];
+      const vals = [];
+      let pop = 0;
+
+      for (const f of polys){
+        const p = f.properties || {};
+        const v = num(p.per_capita_income);
+        if (v != null) vals.push(v);
+        const pp = num(p.population);
+        if (pp != null) pop += pp;
+      }
+      if (vals.length) avgInc = vals.reduce((a,b)=>a+b,0) / vals.length;
+      popSum = pop || null;
+    }
+
+    kAvgInc.textContent = avgInc != null ? money(avgInc) : "—";
+
+    // Retailers per 10k people (in view)
+    if (popSum != null && popSum > 0) {
+      const rate = inViewN / (popSum / 10000);
+      kRate.textContent = rate.toFixed(2);
+    } else {
+      kRate.textContent = "—";
+    }
+
+    // Retailers by income bin (in view) — accurate by checking underlying polygon
+    const labels = ["Low","Lower-mid","Mid","Upper-mid","High"];
+    let counts = [0,0,0,0,0];
+
+    if (incomeHasGeom && breaks && map.getLayer(LYR_INCOME)) {
+      for (const f of snapInView) {
+        const ll = getFeatureLngLat(f);
+        if (!ll) continue;
+
+        const under = getIncomeFeatureAtLngLat(ll);
+        if (!under) continue;
+
+        const inc = num((under.properties || {}).per_capita_income);
+        const b = bin5(inc, breaks);
+        if (b != null) counts[b] += 1;
+      }
+      statusEl.textContent = "Updated on idle (pan/zoom to refresh).";
+    } else {
+      statusEl.textContent = incomeHasGeom ? "Income layer not available." : statusEl.textContent;
+    }
+
+    renderBars(labels, counts);
+  }
+
+  // ======= RENDERERS =======
+  function renderBars(labels, counts){
+    const max = Math.max(1, ...counts);
+    barsEl.innerHTML = "";
+    labels.forEach((lab,i) => {
+      const row = document.createElement("div");
+      row.className = "barrow";
+      row.innerHTML = `
+        <div class="barlabel">${lab}</div>
+        <div class="barwrap"><div class="bar" style="width:${(counts[i]/max)*100}%"></div></div>
+        <div class="barval">${counts[i]}</div>
+      `;
+      barsEl.appendChild(row);
+    });
+  }
+
+  function renderLegend(b){
+    legendEl.innerHTML = "";
+    const rows = [
+      {c:COLORS[0], t: b ? `< ${money(b[0])}` : "Low"},
+      {c:COLORS[1], t: b ? `${money(b[0])} – ${money(b[1])}` : "—"},
+      {c:COLORS[2], t: b ? `${money(b[1])} – ${money(b[2])}` : "—"},
+      {c:COLORS[3], t: b ? `${money(b[2])} – ${money(b[3])}` : "—"},
+      {c:COLORS[4], t: b ? `≥ ${money(b[3])}` : "High"},
+    ];
+    rows.forEach(r => {
+      const div = document.createElement("div");
+      div.className = "legrow";
+      div.innerHTML = `<span class="sw" style="background:${r.c}"></span><span>${r.t}</span>`;
+      legendEl.appendChild(div);
+    });
+  }
+
+  // ======= DATA LOADING =======
+  async function fetchJSON(path){
+    const res = await fetch(path, { cache:"no-store" });
+    if (!res.ok) throw new Error(`Fetch failed ${path}: ${res.status}`);
+    return res.json();
+  }
+
+  function filterSnapKingCountyWA(fc){
+    const feats = fc.features || [];
+    const keep = feats.filter(f => {
+      const p = f.properties || {};
+      return String(p.State||"").trim().toUpperCase()==="WA"
+          && String(p.County||"").trim().toUpperCase()==="KING";
+    });
+    return { type:"FeatureCollection", features: keep };
+  }
+
+  // ======= INCOME NORMALIZATION (turn crazy joined names into clean props) =======
+  function normalizeIncomeProps(fc){
+    for (const f of (fc.features || [])){
+      const p = f.properties || {};
+      const keys = Object.keys(p);
+
+      // Detect likely ACS join keys
+      const perCapKey = keys.find(k => /_B19301_001E$/i.test(k)) || keys.find(k => /B19301_001E/i.test(k));
+      const popKey    = keys.find(k => /_B01001_001E$/i.test(k)) || keys.find(k => /B01001_001E/i.test(k));
+
+      // Write normalized fields
+      if (perCapKey) f.properties.per_capita_income = num(p[perCapKey]);
+      if (popKey)    f.properties.population        = num(p[popKey]);
+    }
+  }
+
+  // ======= MAP QUERY HELPERS =======
+  function getIncomeFeatureAtLngLat(lngLat){
+    if (!lngLat || !map.getLayer(LYR_INCOME)) return null;
+    const pt = map.project(lngLat);
+    const hits = map.queryRenderedFeatures(pt, { layers:[LYR_INCOME] });
+    return (hits && hits.length) ? hits[0] : null;
+  }
+
+  function getFeatureLngLat(feat){
+    if (!feat || !feat.geometry) return null;
+    const g = feat.geometry;
+    if (g.type === "Point" && Array.isArray(g.coordinates)) {
+      return { lng: g.coordinates[0], lat: g.coordinates[1] };
+    }
+    return null;
+  }
+
+  function getSnapFeaturesInViewDeduped(){
+    if (!map.getLayer(LYR_SNAP)) return [];
+    const feats = map.queryRenderedFeatures({ layers:[LYR_SNAP] }) || [];
+    const out = [];
+    const seen = new Set();
+
+    for (const f of feats){
+      const p = f.properties || {};
+      const ll = getFeatureLngLat(f);
+      // Choose a stable unique key if possible
+      const key =
+        p.Store_ID || p.OBJECTID || p.id || p.license_number ||
+        (ll ? `${ll.lng.toFixed(6)},${ll.lat.toFixed(6)}` : JSON.stringify(p));
+
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(f);
+    }
+    return out;
+  }
+
+  // ======= CHOROPLETH BREAKS + BINNING =======
+  function quintileBreaks(fc, field){
+    const vals = (fc.features||[])
+      .map(f => num(f.properties && f.properties[field]))
+      .filter(v => v!=null)
+      .sort((a,b)=>a-b);
+
+    if (!vals.length) return [1,2,3,4]; // fallback (won't be used meaningfully)
+
+    const q = p => quant(vals,p);
+    return [q(0.2), q(0.4), q(0.6), q(0.8)];
+  }
+
+  function quant(sorted,p){
+    const n = sorted.length;
+    const idx = (n - 1) * p;
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    if (lo === hi) return sorted[lo];
+    const w = idx - lo;
+    return sorted[lo]*(1-w) + sorted[hi]*w;
+  }
+
+  function bin5(v, b){
+    if (v==null) return null;
+    if (v < b[0]) return 0;
+    if (v < b[1]) return 1;
+    if (v < b[2]) return 2;
+    if (v < b[3]) return 3;
+    return 4; 
+  }
+
+  // ======= GENERAL HELPERS =======
+  function num(v){
+    if (v==null) return null;
+    const n = (typeof v==="number") ? v : Number(String(v).replace(/[, $]/g,""));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function fmtInt(n){ return new Intl.NumberFormat().format(n); }
+
+  function money(n){
+    return new Intl.NumberFormat(undefined,{style:"currency",currency:"USD",maximumFractionDigits:0}).format(n);
+  }
+
+  function esc(s){
+    return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+
+  function debounce(fn,ms){
+    let t=null;
+    return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args),ms); };
+  }
+</script>
+</body>
+</html>
