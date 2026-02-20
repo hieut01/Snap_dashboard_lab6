@@ -1,6 +1,6 @@
 ## Web map link
 
-URL: https://[your_github_username].github.io/[your_repository_name]/
+URL: https://hieut01.github.io/Snap_dashboard_lab6/
 
 ## What this project is
 
@@ -16,7 +16,7 @@ Dynamic numbers for total retailers and retailers in view
 Chart showing retailers by income level (updates with the map view)
 
 
-Data Sets:
+## Data Sets:
 
 SNAP Retailer CSV - https://usda-snap-retailers-usda-fns.hub.arcgis.com/datasets/8b260f9a10b0459aa441ad8588c2251c_0/about
 
